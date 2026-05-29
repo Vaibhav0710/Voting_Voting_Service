@@ -60,7 +60,7 @@ The **Voting Service** is the heart of the system. It is responsible for process
 | **User Service** | OpenFeign (sync) | `GET /api/v1/auth/validate` | Validates JWT token |
 | **Candidate Service** | OpenFeign (sync) | `GET /api/v1/candidates/{id}/validate` | Confirms candidate is active and belongs to the election |
 | **Voting Service** | Kafka (async) | Listens to `candidate.status-changed` | Reacts to candidate disqualifications |
-| **Result Service** | Kafka (async) | Listens to `vote.cast` | Aggregates votes in real-time |
+| **Result Service** | Kafka (async) | Publishes to `vote.cast` | Aggregates votes in real-time |
 
 ---
 
@@ -130,6 +130,29 @@ CREATE TABLE votes (
 dataToHash = userId + candidateId + electionId + timestamp + prevHash
 voteHash = SHA_256(dataToHash)
 ```
+
+---
+
+## 📡 Kafka Events Published
+
+### `vote.cast` Topic
+Published after every successful vote. Consumed by the Result Service for real-time tallying.
+
+```json
+{
+  "voteId": "uuid",
+  "userId": "uuid",
+  "candidateId": "uuid",
+  "electionId": "uuid",
+  "voteHash": "sha256-hash",
+  "timestamp": "2026-05-29T00:00:00"
+}
+```
+
+**Partition Key:** `electionId` — ensures all votes for the same election are ordered.
+
+### `vote.verified` Topic
+Published after a vote's hash integrity is verified by an admin.
 
 ---
 
