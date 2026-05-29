@@ -116,10 +116,18 @@ public class VoteService implements VoteServiceInterface {
         redisTemplate.opsForValue().set(votedKey, "1", votedTtl, TimeUnit.SECONDS);
         redisTemplate.opsForValue().set(idempotencyKey, newHash, idempotencyTtl, TimeUnit.SECONDS);
 
-        // 7. Kafka Event
-        VoteResponse response = voteMapper.toVoteResponse(vote);
-        voteEventProducer.publishVoteCast(response);
-        return response;
+        // 7. Kafka Event — publish rich event for downstream consumers (Result Service)
+        VoteCastEvent voteCastEvent = VoteCastEvent.builder()
+                .voteId(vote.getExternalId())
+                .userId(vote.getUserId())
+                .candidateId(vote.getCandidateId())
+                .electionId(vote.getElectionId())
+                .voteHash(vote.getVoteHash())
+                .timestamp(vote.getTimestamp())
+                .build();
+        voteEventProducer.publishVoteCast(voteCastEvent);
+
+        return voteMapper.toVoteResponse(vote);
     }
 
     @Override
