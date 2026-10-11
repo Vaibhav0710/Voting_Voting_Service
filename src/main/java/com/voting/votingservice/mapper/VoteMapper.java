@@ -9,23 +9,14 @@ import org.springframework.stereotype.Component;
 public class VoteMapper {
 
     public VoteResponse toVoteResponse(Vote vote) {
-        if (vote == null) {
-            return null;
-        }
-        
-        return VoteResponse.builder()
-                .voteId(vote.getExternalId())
-                .voteHash(vote.getVoteHash())
-                .timestamp(vote.getTimestamp())
-                .message("Vote successfully cast!")
-                .build();
+        return buildResponse(vote, "Vote successfully cast!", false);
+    }
+
+    public VoteResponse toReplayResponse(Vote vote) {
+        return buildResponse(vote, "Vote already recorded (idempotent replay).", true);
     }
 
     public VoteReceiptResponse toReceiptResponse(Vote vote) {
-        if (vote == null) {
-            return null;
-        }
-        
         return VoteReceiptResponse.builder()
                 .voteId(vote.getExternalId())
                 .candidateId(vote.getCandidateId())
@@ -34,6 +25,16 @@ public class VoteMapper {
                 .prevHash(vote.getPrevHash())
                 .status(vote.getStatus())
                 .timestamp(vote.getTimestamp())
+                .build();
+    }
+
+    private static VoteResponse buildResponse(Vote vote, String message, boolean replay) {
+        return VoteResponse.builder()
+                .voteId(vote.getExternalId())
+                .voteHash(vote.getVoteHash())
+                .timestamp(vote.getTimestamp())
+                .message(message)
+                .replay(replay)
                 .build();
     }
 }

@@ -15,7 +15,7 @@ import java.util.UUID;
  * <ul>
  *   <li><b>Unique constraint:</b> (user_id, election_id) — absolute DB-level double-vote prevention</li>
  *   <li><b>vote_hash:</b> SHA-256 hash for tamper detection</li>
- *   <li><b>prev_hash:</b> Reserved for optional chain linking (disabled by default)</li>
+ *   <li><b>prev_hash:</b> Hash of the previous vote in the election when chaining is on ({@code voting.chain.enabled}), else null</li>
  *   <li><b>idempotency_key:</b> Client-generated UUID for safe retries</li>
  * </ul>
  */

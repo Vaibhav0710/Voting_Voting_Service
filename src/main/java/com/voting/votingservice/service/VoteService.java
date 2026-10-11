@@ -1,123 +1,221 @@
 package com.voting.votingservice.service;
 
-import com.voting.votingservice.client.CandidateClient;
-import com.voting.votingservice.dto.*;
-import com.voting.votingservice.exception.AccessDeniedException;
+import com.voting.votingservice.config.VotingProperties;
+import com.voting.votingservice.dto.ChainValidationResponse;
+import com.voting.votingservice.dto.VoteCastEvent;
+import com.voting.votingservice.dto.VoteCountResponse;
+import com.voting.votingservice.dto.VoteReceiptResponse;
+import com.voting.votingservice.dto.VoteRequest;
+import com.voting.votingservice.dto.VoteResponse;
+import com.voting.votingservice.dto.VoteVerificationResponse;
 import com.voting.votingservice.exception.DuplicateVoteException;
-import com.voting.votingservice.exception.InvalidCandidateException;
+import com.voting.votingservice.exception.VoteAccessDeniedException;
 import com.voting.votingservice.exception.VoteNotFoundException;
 import com.voting.votingservice.mapper.VoteMapper;
+import com.voting.votingservice.model.ElectionChainHead;
 import com.voting.votingservice.model.Vote;
 import com.voting.votingservice.model.enums.VoteStatus;
 import com.voting.votingservice.repository.VoteRepository;
-import feign.FeignException;
-import lombok.RequiredArgsConstructor;
+import com.voting.votingservice.security.JwtPrincipal;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
-import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 /**
- * Core business logic for casting votes safely with high concurrency.
+ * Vote casting, receipts, verification and chain validation.
+ * <p>
+ * Double-vote defence: idempotent replay → Redis voted flag → DB unique (user_id, election_id).
+ * Redis and Kafka side effects run after commit ({@link VoteCastSideEffects}).
  */
-@Service
-@RequiredArgsConstructor
 @Slf4j
+@Service
 public class VoteService implements VoteServiceInterface {
 
+    private static final String ALREADY_VOTED = "User has already voted in this election.";
+
     private final VoteRepository voteRepository;
-    private final HashingService hashingService;
-    private final CandidateClient candidateClient;
-    private final StringRedisTemplate redisTemplate;
+    private final VoteHasher voteHasher;
+    private final CandidateValidator candidateValidator;
+    private final VoteRedisStore redisStore;
+    private final ChainHeadService chainHeadService;
     private final VoteMapper voteMapper;
     private final VoteEventProducer voteEventProducer;
+    private final ApplicationEventPublisher eventPublisher;
+    private final boolean chainEnabled;
 
-    @Value("${voting.redis.key-prefix:vot:}")
-    private String redisPrefix;
-
-    @Value("${voting.redis.voted-ttl:86400}")
-    private long votedTtl;
-
-    @Value("${voting.redis.idempotency-ttl:86400}")
-    private long idempotencyTtl;
+    public VoteService(VoteRepository voteRepository, VoteHasher voteHasher, CandidateValidator candidateValidator,
+                       VoteRedisStore redisStore, ChainHeadService chainHeadService, VoteMapper voteMapper,
+                       VoteEventProducer voteEventProducer, ApplicationEventPublisher eventPublisher,
+                       VotingProperties properties) {
+        this.voteRepository = voteRepository;
+        this.voteHasher = voteHasher;
+        this.candidateValidator = candidateValidator;
+        this.redisStore = redisStore;
+        this.chainHeadService = chainHeadService;
+        this.voteMapper = voteMapper;
+        this.voteEventProducer = voteEventProducer;
+        this.eventPublisher = eventPublisher;
+        this.chainEnabled = properties.chain().enabled();
+    }
 
     @Override
     @Transactional
     public VoteResponse castVote(UUID userId, VoteRequest request) {
-        String votedKey = redisPrefix + "voted:" + userId + ":" + request.getElectionId();
-        String idempotencyKey = redisPrefix + "idempotency:" + request.getIdempotencyKey();
-
-        // 1. Double Vote Check via Redis
-        if (Boolean.TRUE.equals(redisTemplate.hasKey(votedKey))) {
-            throw new DuplicateVoteException("User has already voted in this election.");
+        Optional<Vote> previous = findIdempotentVote(userId, request.getIdempotencyKey());
+        if (previous.isPresent()) {
+            log.info("Idempotent replay for user {} key {}", userId, request.getIdempotencyKey());
+            return voteMapper.toReplayResponse(previous.get());
         }
-
-        // 2. Candidate Validation
-        try {
-            candidateClient.validateCandidate(request.getCandidateId(), request.getElectionId());
-        } catch (FeignException e) {
-            log.error("Candidate validation failed: {}", e.getMessage());
-            throw new InvalidCandidateException("Candidate is invalid or not active for this election.");
+        if (redisStore.hasVoted(userId, request.getElectionId())) {
+            throw new DuplicateVoteException(ALREADY_VOTED);
         }
+        candidateValidator.ensureCandidateValid(request.getCandidateId(), request.getElectionId());
 
-        // 3. Idempotency Check
-        String cachedHash = redisTemplate.opsForValue().get(idempotencyKey);
-        if (cachedHash != null) {
-            log.info("Returning cached response for idempotency key: {}", request.getIdempotencyKey());
-            return VoteResponse.builder()
-                    .voteHash(cachedHash)
-                    .message("Vote captured previously (Idempotent response)")
-                    .build();
+        Vote saved = persist(buildVote(userId, request));
+        eventPublisher.publishEvent(new VoteRecordedEvent(toCastEvent(saved), request.getIdempotencyKey()));
+        return voteMapper.toVoteResponse(saved);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public VoteReceiptResponse getVoteReceipt(UUID voteExternalId, JwtPrincipal requester) {
+        return voteMapper.toReceiptResponse(findOwnedVote(voteExternalId, requester));
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public boolean hasUserVoted(UUID userId, UUID electionId) {
+        return redisStore.hasVoted(userId, electionId)
+                || voteRepository.existsByUserIdAndElectionId(userId, electionId);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public Page<VoteReceiptResponse> getElectionVotes(UUID electionId, Pageable pageable) {
+        return voteRepository.findByElectionId(electionId, pageable).map(voteMapper::toReceiptResponse);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public VoteCountResponse getVoteCounts(UUID electionId) {
+        List<VoteCountResponse.CandidateVoteCount> counts = voteRepository
+                .countVotesByElectionGroupedByCandidate(electionId).stream()
+                .map(p -> new VoteCountResponse.CandidateVoteCount(p.getCandidateId(), p.getVoteCount()))
+                .toList();
+        return VoteCountResponse.builder()
+                .electionId(electionId)
+                .totalVotes(voteRepository.countByElectionId(electionId))
+                .candidateVoteCounts(counts)
+                .build();
+    }
+
+    @Override
+    @Transactional
+    public VoteVerificationResponse verifyVote(UUID voteExternalId, JwtPrincipal requester) {
+        Vote vote = findOwnedVote(voteExternalId, requester);
+        String computedHash = voteHasher.computeHash(vote);
+        boolean valid = computedHash.equals(vote.getVoteHash());
+        vote.setStatus(valid ? VoteStatus.VERIFIED : VoteStatus.DISPUTED);
+
+        VoteVerificationResponse response = VoteVerificationResponse.builder()
+                .voteId(voteExternalId)
+                .hashValid(valid)
+                .status(vote.getStatus())
+                .storedHash(vote.getVoteHash())
+                .computedHash(computedHash)
+                .message(valid ? "Vote hash is valid and untampered." : "Vote hash MISMATCH - potential tampering detected.")
+                .build();
+        if (valid) {
+            voteEventProducer.publishVoteVerified(response);
         }
+        return response;
+    }
 
-        // 4. Hash Generation and DB entity building
-        LocalDateTime now = LocalDateTime.now();
-        long timestampSeconds = now.toEpochSecond(ZoneOffset.UTC);
-        
-        Optional<Vote> lastVoteOpt = voteRepository.findTopByElectionIdOrderByTimestampDesc(request.getElectionId());
-        String prevHash = lastVoteOpt.map(Vote::getVoteHash).orElse("GENESIS");
+    @Override
+    @Transactional(readOnly = true)
+    public ChainValidationResponse validateChain(UUID electionId) {
+        List<Vote> votes = voteRepository.findByElectionIdOrderByIdAsc(electionId);
+        int brokenLinks = 0;
+        String expectedPrevHash = ElectionChainHead.GENESIS;
+        for (Vote vote : votes) {
+            // 1. A chained vote must point at the hash of the previous chained vote
+            if (vote.getPrevHash() != null && !expectedPrevHash.equals(vote.getPrevHash())) {
+                brokenLinks++;
+            }
+            // 2. Every vote's own hash must still match its data
+            if (!voteHasher.computeHash(vote).equals(vote.getVoteHash())) {
+                brokenLinks++;
+            }
+            // 3. Unchained votes (chaining off) do not move the expected link
+            if (vote.getPrevHash() != null) {
+                expectedPrevHash = vote.getVoteHash();
+            }
+        }
+        boolean valid = brokenLinks == 0;
+        return ChainValidationResponse.builder()
+                .electionId(electionId)
+                .chainValid(valid)
+                .totalVotesChecked(votes.size())
+                .brokenLinks(brokenLinks)
+                .message(chainMessage(votes.isEmpty(), valid, brokenLinks))
+                .build();
+    }
 
-        String dataToHash = userId.toString() + request.getCandidateId().toString() + 
-                            request.getElectionId().toString() + timestampSeconds + prevHash;
-        String newHash = hashingService.generateHash(dataToHash);
+    private Optional<Vote> findIdempotentVote(UUID userId, String idempotencyKey) {
+        return redisStore.findIdempotentVoteId(userId, idempotencyKey)
+                .flatMap(voteRepository::findByExternalId)
+                .or(() -> voteRepository.findByIdempotencyKeyAndUserId(idempotencyKey, userId));
+    }
 
+    private Vote buildVote(UUID userId, VoteRequest request) {
+        ElectionChainHead head = chainEnabled ? chainHeadService.lockHead(request.getElectionId()) : null;
         Vote vote = Vote.builder()
+                .externalId(UUID.randomUUID())
                 .userId(userId)
                 .candidateId(request.getCandidateId())
                 .electionId(request.getElectionId())
-                .voteHash(newHash)
-                .prevHash(prevHash)
+                .prevHash(head == null ? null : head.getLastHash())
                 .idempotencyKey(request.getIdempotencyKey())
-                .timestamp(now)
+                .timestamp(LocalDateTime.now().truncatedTo(ChronoUnit.MICROS))
                 .status(VoteStatus.CAST)
                 .build();
-
-        // 5. DB Persistence with Race Condition Safety
-        try {
-            vote = voteRepository.saveAndFlush(vote);
-        } catch (DataIntegrityViolationException ex) {
-            log.warn("Double vote detected at DB constraint level for user {} in election {}", userId, request.getElectionId());
-            throw new DuplicateVoteException("User has already voted in this election.");
+        vote.setVoteHash(voteHasher.computeHash(vote));
+        if (head != null) {
+            head.setLastHash(vote.getVoteHash());
         }
+        return vote;
+    }
 
-        // 6. Redis State Updates
-        redisTemplate.opsForValue().set(votedKey, "1", votedTtl, TimeUnit.SECONDS);
-        redisTemplate.opsForValue().set(idempotencyKey, newHash, idempotencyTtl, TimeUnit.SECONDS);
+    private Vote persist(Vote vote) {
+        try {
+            return voteRepository.saveAndFlush(vote);
+        } catch (DataIntegrityViolationException e) {
+            log.warn("Unique constraint rejected vote for user {} in election {}", vote.getUserId(), vote.getElectionId());
+            throw new DuplicateVoteException(ALREADY_VOTED);
+        }
+    }
 
-        // 7. Kafka Event — publish rich event for downstream consumers (Result Service)
-        VoteCastEvent voteCastEvent = VoteCastEvent.builder()
+    private Vote findOwnedVote(UUID voteExternalId, JwtPrincipal requester) {
+        Vote vote = voteRepository.findByExternalId(voteExternalId)
+                .orElseThrow(() -> new VoteNotFoundException("Vote not found with ID: " + voteExternalId));
+        if (!requester.isAdmin() && !vote.getUserId().equals(requester.userId())) {
+            throw new VoteAccessDeniedException("You are not authorized to access this vote.");
+        }
+        return vote;
+    }
+
+    private static VoteCastEvent toCastEvent(Vote vote) {
+        return VoteCastEvent.builder()
                 .voteId(vote.getExternalId())
                 .userId(vote.getUserId())
                 .candidateId(vote.getCandidateId())
@@ -125,144 +223,12 @@ public class VoteService implements VoteServiceInterface {
                 .voteHash(vote.getVoteHash())
                 .timestamp(vote.getTimestamp())
                 .build();
-        voteEventProducer.publishVoteCast(voteCastEvent);
-
-        return voteMapper.toVoteResponse(vote);
     }
 
-    @Override
-    @Transactional(readOnly = true)
-    public VoteReceiptResponse getVoteReceipt(UUID voteExternalId, UUID requestingUserId, String role) {
-        Vote vote = voteRepository.findByExternalId(voteExternalId)
-                .orElseThrow(() -> new VoteNotFoundException("Vote not found with ID: " + voteExternalId));
-                
-        if (!"ROLE_ADMIN".equals(role) && !vote.getUserId().equals(requestingUserId)) {
-            throw new AccessDeniedException("You are not authorized to view this vote receipt.");
+    private static String chainMessage(boolean empty, boolean valid, int brokenLinks) {
+        if (empty) {
+            return "No votes in this election yet.";
         }
-        
-        return voteMapper.toReceiptResponse(vote);
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public boolean hasUserVoted(UUID userId, UUID electionId) {
-        String votedKey = redisPrefix + "voted:" + userId + ":" + electionId;
-        if (Boolean.TRUE.equals(redisTemplate.hasKey(votedKey))) {
-            return true;
-        }
-        return voteRepository.existsByUserIdAndElectionId(userId, electionId);
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public Page<VoteReceiptResponse> getElectionVotes(UUID electionId, Pageable pageable) {
-        return voteRepository.findByElectionId(electionId, pageable)
-                .map(voteMapper::toReceiptResponse);
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public VoteCountResponse getVoteCounts(UUID electionId) {
-        List<VoteRepository.VoteCountProjection> projections = voteRepository.countVotesByElectionGroupedByCandidate(electionId);
-        long totalVotes = voteRepository.countByElectionId(electionId);
-        
-        List<VoteCountResponse.CandidateVoteCount> candidateCounts = projections.stream()
-                .map(p -> VoteCountResponse.CandidateVoteCount.builder()
-                        .candidateId(p.getCandidateId())
-                        .voteCount(p.getVoteCount())
-                        .build())
-                .collect(Collectors.toList());
-                
-        return VoteCountResponse.builder()
-                .electionId(electionId)
-                .totalVotes(totalVotes)
-                .candidateVoteCounts(candidateCounts)
-                .build();
-    }
-
-    @Override
-    @Transactional
-    public VoteVerificationResponse verifyVote(UUID voteExternalId) {
-        Vote vote = voteRepository.findByExternalId(voteExternalId)
-                .orElseThrow(() -> new VoteNotFoundException("Vote not found with ID: " + voteExternalId));
-                
-        long timestampSeconds = vote.getTimestamp().toEpochSecond(ZoneOffset.UTC);
-        String dataToHash = vote.getUserId().toString() + vote.getCandidateId().toString() + 
-                            vote.getElectionId().toString() + timestampSeconds + vote.getPrevHash();
-        
-        String computedHash = hashingService.generateHash(dataToHash);
-        boolean isValid = computedHash.equals(vote.getVoteHash());
-        
-        if (isValid && vote.getStatus() != VoteStatus.VERIFIED) {
-            vote.setStatus(VoteStatus.VERIFIED);
-            voteRepository.save(vote);
-        } else if (!isValid && vote.getStatus() != VoteStatus.DISPUTED) {
-            vote.setStatus(VoteStatus.DISPUTED);
-            voteRepository.save(vote);
-        }
-        
-        VoteVerificationResponse response = VoteVerificationResponse.builder()
-                .voteId(voteExternalId)
-                .hashValid(isValid)
-                .status(vote.getStatus())
-                .storedHash(vote.getVoteHash())
-                .computedHash(computedHash)
-                .message(isValid ? "Vote hash is valid and untampered." : "Vote hash MISMATCH - potential tampering detected.")
-                .build();
-                
-        if (isValid) {
-            voteEventProducer.publishVoteVerified(response);
-        }
-        
-        return response;
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public ChainValidationResponse validateChain(UUID electionId) {
-        List<Vote> votes = voteRepository.findByElectionIdOrderByTimestampAsc(electionId);
-        
-        if (votes.isEmpty()) {
-            return ChainValidationResponse.builder()
-                    .electionId(electionId)
-                    .chainValid(true)
-                    .totalVotesChecked(0)
-                    .brokenLinks(0)
-                    .message("No votes in this election yet.")
-                    .build();
-        }
-        
-        int brokenLinks = 0;
-        String expectedPrevHash = "GENESIS";
-        
-        for (Vote vote : votes) {
-            // 1. Verify prevHash matches the actual expected prevHash
-            if (!expectedPrevHash.equals(vote.getPrevHash())) {
-                brokenLinks++;
-            }
-            
-            // 2. Verify vote's own hash hasn't been tampered with
-            long timestampSeconds = vote.getTimestamp().toEpochSecond(ZoneOffset.UTC);
-            String dataToHash = vote.getUserId().toString() + vote.getCandidateId().toString() + 
-                                vote.getElectionId().toString() + timestampSeconds + vote.getPrevHash();
-            String computedHash = hashingService.generateHash(dataToHash);
-            
-            if (!computedHash.equals(vote.getVoteHash())) {
-                brokenLinks++;
-            }
-            
-            // Next vote should point to this vote's hash
-            expectedPrevHash = vote.getVoteHash();
-        }
-        
-        boolean isValid = brokenLinks == 0;
-        
-        return ChainValidationResponse.builder()
-                .electionId(electionId)
-                .chainValid(isValid)
-                .totalVotesChecked(votes.size())
-                .brokenLinks(brokenLinks)
-                .message(isValid ? "Chain is fully valid." : "Chain is broken. Found " + brokenLinks + " invalid links.")
-                .build();
+        return valid ? "Chain is fully valid." : "Chain is broken. Found " + brokenLinks + " invalid links.";
     }
 }

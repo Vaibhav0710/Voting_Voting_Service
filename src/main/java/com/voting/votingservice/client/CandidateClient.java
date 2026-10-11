@@ -8,17 +8,13 @@ import org.springframework.web.bind.annotation.RequestParam;
 import java.util.UUID;
 
 /**
- * Feign client for communicating with the Candidate Service.
+ * Feign client for the Candidate Service (resolved through Eureka).
  */
 @FeignClient(name = "candidate-service")
 public interface CandidateClient {
 
-    /**
-     * Validates if a candidate exists and is active for the given election.
-     * Candidate Service returns 200 OK if valid, or 400/404 if invalid.
-     */
     @GetMapping("/api/v1/candidates/{id}/validate")
-    void validateCandidate(
+    CandidateApiResponse<CandidateValidation> validateCandidate(
             @PathVariable("id") UUID candidateId,
             @RequestParam("electionId") UUID electionId
     );

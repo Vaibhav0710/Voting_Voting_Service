@@ -5,50 +5,93 @@ spring:
   application:
     name: voting-service
   datasource:
-    url: ${VOTING_DB_URL:jdbc:postgresql://localhost:5432/voting_service_db}
-    username: ${VOTING_DB_USER:postgres}
-    password: ${VOTING_DB_PASSWORD:postgres}
+    # VOTING_DB_URL is the server base URL shared by all services, e.g. jdbc:postgresql://localhost:5432
+    url: ${VOTING_DB_URL}/voting_service_db
+    username: ${VOTING_DB_USER}
+    password: ${VOTING_DB_PASSWORD}
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: ${JPA_DDL_AUTO:update}
     show-sql: false
-    properties:
-      hibernate:
-        format_sql: true
-        dialect: org.hibernate.dialect.PostgreSQLDialect
+    open-in-view: false
   data:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
   kafka:
-    bootstrap-servers: localhost:9092
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false
+        # Fail fast (5 s, default 60 s) when the broker is down; the vote is already committed by then.
+        max.block.ms: 5000
     consumer:
       group-id: voting-service-group
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
       properties:
-        spring.json.trusted.packages: "*"
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+        spring.json.use.type.headers: false
+        spring.json.value.default.type: com.voting.votingservice.dto.CandidateEvent
+        spring.json.trusted.packages: com.voting.votingservice.dto
 
 voting:
   redis:
     key-prefix: "vot:"
     voted-ttl: 86400
     idempotency-ttl: 86400
+  chain:
+    # Link each vote to the previous vote's hash in its election (serialised per election).
+    enabled: ${VOTING_CHAIN_ENABLED:true}
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      candidateService:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+        register-health-indicator: true
+        ignore-exceptions:
+          - com.voting.votingservice.exception.InvalidCandidateException
+  retry:
+    instances:
+      candidateService:
+        max-attempts: 3
+        wait-duration: 200ms
+        retry-exceptions:
+          - feign.RetryableException
+          - feign.FeignException$ServiceUnavailable
+          - feign.FeignException$BadGateway
+          - feign.FeignException$GatewayTimeout
+  bulkhead:
+    instances:
+      candidateService:
+        max-concurrent-calls: 50
+        max-wait-duration: 100ms
 
 jwt:
   secret: ${JWT_SECRET}
-  expiration: ${JWT_EXPIRATION:86400000}
 
 eureka:
   client:
     service-url:
-      defaultZone: http://localhost:8761/eureka/
+      defaultZone: ${EUREKA_URL:http://localhost:8761/eureka/}
 
 management:
   endpoints:
     web:
       exposure:
         include: health, prometheus, info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  health:
+    circuitbreakers:
+      enabled: true

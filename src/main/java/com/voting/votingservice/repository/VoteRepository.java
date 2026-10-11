@@ -21,25 +21,26 @@ public interface VoteRepository extends JpaRepository<Vote, Long> {
 
     Page<Vote> findByElectionId(UUID electionId, Pageable pageable);
 
-    Optional<Vote> findByIdempotencyKey(String idempotencyKey);
+    Optional<Vote> findByIdempotencyKeyAndUserId(String idempotencyKey, UUID userId);
 
-    Optional<Vote> findTopByElectionIdOrderByTimestampDesc(UUID electionId);
+    Optional<Vote> findTopByElectionIdOrderByIdDesc(UUID electionId);
 
     @Query("SELECT v.candidateId AS candidateId, COUNT(v) AS voteCount " +
            "FROM Vote v WHERE v.electionId = :electionId " +
            "GROUP BY v.candidateId")
-    List<VoteCountProjection> countVotesByElectionGroupedByCandidate(
-            @Param("electionId") UUID electionId);
+    List<VoteCountProjection> countVotesByElectionGroupedByCandidate(@Param("electionId") UUID electionId);
 
     long countByElectionId(UUID electionId);
 
-    List<Vote> findByElectionIdOrderByTimestampAsc(UUID electionId);
+    /** Insertion order, which is chain order because chained inserts are serialised per election. */
+    List<Vote> findByElectionIdOrderByIdAsc(UUID electionId);
 
     /**
      * Projection interface for vote count aggregation queries.
      */
     interface VoteCountProjection {
         UUID getCandidateId();
+
         Long getVoteCount();
     }
 }

@@ -13,21 +13,20 @@
 
 ## 📌 Overview
 
-The **Voting Service** is the heart of the system. It is responsible for processing vote casting securely, ensuring no user can double vote, and maintaining a tamper-proof audit trail using SHA-256 cryptographic hashing (blockchain-inspired). It leverages Redis for high-speed idempotency and rate-limiting, and PostgreSQL for absolute data consistency.
+The **Voting Service** is the heart of the system. It is responsible for processing vote casting securely, ensuring no user can double vote, and maintaining a tamper-proof audit trail using SHA-256 cryptographic hashing (blockchain-inspired). It uses Redis for fast double-vote and idempotency checks and PostgreSQL for absolute data consistency.
 
 ### Feature Status
 - ✅ Secure vote casting endpoint
-- ✅ Double-vote prevention (3 layers: Redis Set, DB Constraint, Idempotency keys)
-- ✅ Cryptographic vote hashing (SHA-256)
-- ✅ Vote receipt generation and validation
+- ✅ Double-vote prevention (3 layers: idempotency key, Redis flag, DB constraint), tested with 50 concurrent requests
+- ✅ Cryptographic vote hashing (SHA-256) and a per-election hash chain that is safe under concurrency
+- ✅ Vote receipt generation and verification
 - ✅ Chain validation mechanism to detect tampering
-- ✅ Cross-service integration with User & Candidate services (via OpenFeign)
-- ✅ Event-driven architecture (Kafka producers and consumers)
+- ✅ Candidate validation via OpenFeign with retry, circuit breaker, bulkhead and cached-status fallback
+- ✅ Event-driven architecture (Kafka producers and consumers; events sent after commit)
 - ✅ DTO-based request/response separation
-- ✅ JWT integration and validation
-- 🔜 Unit + Integration tests
-- 🔜 Redis Caching implementations (mostly done)
-- 🔜 Actuator & Prometheus metrics
+- ✅ JWT validation in the service (userId claim) and role-based access
+- ✅ Unit + integration tests (54)
+- 🔜 Prometheus metrics, tracing and JSON logs
 
 ---
 
@@ -46,21 +45,21 @@ The **Voting Service** is the heart of the system. It is responsible for process
     │  Service   │  │ Service    │  │ SERVICE     │
     │  (8081)    │  │ (8082)     │  │ (8083)      │
     └────────────┘  └────────────┘  └──────┬──────┘
-         ▲               ▲                 │
-         │               │                 ▼
-         └───────(OpenFeign Sync)──────────┘
+     issues JWTs         ▲                 │
+                         │                 ▼
+                         └─(OpenFeign Sync)┘
 
          ────────(Kafka Async Events)──────► Result Service (8084)
 ```
 
 ### Cross-Service Communication
 
-| Target / Consumer | Protocol | Endpoints Called / Topic | Purpose |
+| Target / Source | Protocol | Endpoints Called / Topic | Purpose |
 |-------------------|----------|--------------------------|---------|
-| **User Service** | OpenFeign (sync) | `GET /api/v1/auth/validate` | Validates JWT token |
+| **User Service** | none at runtime | — | Issues the JWT; this service verifies it locally with the shared secret |
 | **Candidate Service** | OpenFeign (sync) | `GET /api/v1/candidates/{id}/validate` | Confirms candidate is active and belongs to the election |
-| **Voting Service** | Kafka (async) | Listens to `candidate.status-changed` | Reacts to candidate disqualifications |
-| **Result Service** | Kafka (async) | Publishes to `vote.cast` | Aggregates votes in real-time |
+| **Candidate Service** | Kafka (async, consumed) | `candidate.created` / `status-changed` / `deleted` | Keeps the candidate status cache current |
+| **Result Service** | Kafka (async, published) | `vote.cast` | Aggregates votes in real time |
 
 ---
 
@@ -77,6 +76,7 @@ The **Voting Service** is the heart of the system. It is responsible for process
 | ORM | Spring Data JPA / Hibernate | — |
 | Security | Spring Security + JWT | — |
 | Inter-Service | OpenFeign | — |
+| Resilience | Resilience4j | 2.2.0 |
 | Build Tool | Maven | 3.8+ |
 | Boilerplate | Lombok | — |
 
@@ -93,12 +93,12 @@ http://localhost:8083/api/v1/votes
 
 | Method | Endpoint | Description | Auth Required |
 |--------|----------|-------------|---------------|
-| `POST` | `/api/v1/votes` | Cast a vote (requires `idempotencyKey` header) | `VOTER` |
-| `GET` | `/api/v1/votes/{voteId}` | Fetch a vote receipt | `VOTER` / `ADMIN` |
-| `GET` | `/api/v1/votes/user/{userId}/election/{electionId}` | Check if user voted | INTERNAL |
-| `GET` | `/api/v1/votes/election/{electionId}` | Get all votes in an election | `ADMIN` |
-| `GET` | `/api/v1/votes/election/{electionId}/count` | Get total counts (fallback method) | `ADMIN` |
-| `POST` | `/api/v1/votes/verify/{voteId}` | Verify hash integrity of a specific vote | `ADMIN` |
+| `POST` | `/api/v1/votes` | Cast a vote. Body `{candidateId, electionId, idempotencyKey}`. 201 new vote, 200 idempotent replay, 409 already voted, 400 invalid candidate, 503 Candidate Service down and status unknown | `VOTER` |
+| `GET` | `/api/v1/votes/{voteId}` | Fetch a vote receipt | owner or `ADMIN` |
+| `GET` | `/api/v1/votes/user/{userId}/election/{electionId}` | Check if a user voted | that user or `ADMIN` |
+| `GET` | `/api/v1/votes/election/{electionId}` | All votes in an election (paged: `content` + `page`) | `ADMIN` |
+| `GET` | `/api/v1/votes/election/{electionId}/count` | Vote counts per candidate | public |
+| `POST` | `/api/v1/votes/verify/{voteId}` | Verify hash integrity of a vote | owner or `ADMIN` |
 | `POST` | `/api/v1/votes/chain/validate/{electionId}` | Validate the entire chain of votes | `ADMIN` |
 
 ---
@@ -114,22 +114,45 @@ CREATE TABLE votes (
     user_id         UUID NOT NULL,
     candidate_id    UUID NOT NULL,
     election_id     UUID NOT NULL,
-    vote_hash       VARCHAR(256) NOT NULL,
-    prev_hash       VARCHAR(256) NOT NULL,
+    vote_hash       VARCHAR(64) NOT NULL,
+    prev_hash       VARCHAR(64),             -- NULL when chaining is off
     timestamp       TIMESTAMP NOT NULL,
-    idempotency_key VARCHAR(255) UNIQUE NOT NULL,
-    status          VARCHAR(50) NOT NULL DEFAULT 'CAST',
-    
+    idempotency_key VARCHAR(64),
+    status          VARCHAR(20) NOT NULL,    -- CAST / VERIFIED / DISPUTED
+    created_at      TIMESTAMP NOT NULL,
+
     -- Absolute guarantee against double voting at the DB level
-    CONSTRAINT uq_user_election UNIQUE (user_id, election_id)
+    CONSTRAINT uq_user_election UNIQUE (user_id, election_id),
+    CONSTRAINT uq_idempotency_key UNIQUE (idempotency_key)
+);
+
+-- One row per election: the newest hash of its chain, locked (SELECT … FOR UPDATE) while a vote is cast
+CREATE TABLE election_chain_heads (
+    election_id UUID PRIMARY KEY,
+    last_hash   VARCHAR(64) NOT NULL
 );
 ```
+Tables are created by Hibernate (`ddl-auto: update`).
 
 ### Vote Hashing Logic
 ```
-dataToHash = userId + candidateId + electionId + timestamp + prevHash
-voteHash = SHA_256(dataToHash)
+dataToHash = userId + candidateId + electionId + epochSecondsUtc(timestamp) + (prevHash or "")
+voteHash   = SHA_256(dataToHash)   // 64 hex chars
 ```
+Chaining (`VOTING_CHAIN_ENABLED`, default `true`): `prevHash` is the election's previous vote hash (`GENESIS` for the
+first vote). Votes in one election are linked one at a time under a row lock; different elections never wait on each other.
+
+### Double-vote defence
+1. Idempotency key (per user): a retry returns the original receipt.
+2. Redis flag `vot:voted:{userId}:{electionId}`: fast rejection.
+3. DB unique `(user_id, election_id)`: the final guarantee under races.
+
+Redis flags and the `vote.cast` event are written only after the transaction commits.
+
+### Candidate Service outages
+Candidate validation is wrapped in Resilience4j: 3 retries, a circuit breaker and a bulkhead of 50 calls. If the
+Candidate Service stays down, the vote is decided from a Redis copy of candidate statuses, kept current from
+`candidate.*` Kafka events. With no cached status the vote gets a 503.
 
 ---
 
@@ -152,7 +175,11 @@ Published after every successful vote. Consumed by the Result Service for real-t
 **Partition Key:** `electionId` — ensures all votes for the same election are ordered.
 
 ### `vote.verified` Topic
-Published after a vote's hash integrity is verified by an admin.
+Published (key = `voteId`) when a vote's hash is verified as valid.
+
+## 📥 Kafka Events Consumed
+`candidate.created`, `candidate.status-changed`, `candidate.deleted` update the candidate status cache used during
+Candidate Service outages.
 
 ---
 
@@ -181,12 +208,11 @@ Published after a vote's hash integrity is verified by an admin.
 
 3. **Set environment variables**
    ```bash
-   export VOTING_DB_URL=jdbc:postgresql://localhost:5432/voting_service_db
+   export VOTING_DB_URL=jdbc:postgresql://localhost:5432   # server base URL; /voting_service_db is appended
    export VOTING_DB_USER=postgres
    export VOTING_DB_PASSWORD=yourpassword
-   export REDIS_HOST=localhost
-   export REDIS_PORT=6379
-   export JWT_SECRET=your_jwt_secret
+   export JWT_SECRET=<same Base64 secret as user-service>
+   # optional: REDIS_HOST, REDIS_PORT, KAFKA_BOOTSTRAP_SERVERS, EUREKA_URL, VOTING_CHAIN_ENABLED
    ```
 
 4. **Build and Run**
