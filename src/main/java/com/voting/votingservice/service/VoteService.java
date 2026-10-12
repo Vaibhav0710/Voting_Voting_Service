@@ -8,7 +8,9 @@ import com.voting.votingservice.dto.VoteReceiptResponse;
 import com.voting.votingservice.dto.VoteRequest;
 import com.voting.votingservice.dto.VoteResponse;
 import com.voting.votingservice.dto.VoteVerificationResponse;
+import com.voting.votingservice.exception.CandidateServiceUnavailableException;
 import com.voting.votingservice.exception.DuplicateVoteException;
+import com.voting.votingservice.exception.InvalidCandidateException;
 import com.voting.votingservice.exception.VoteAccessDeniedException;
 import com.voting.votingservice.exception.VoteNotFoundException;
 import com.voting.votingservice.mapper.VoteMapper;
@@ -51,11 +53,13 @@ public class VoteService implements VoteServiceInterface {
     private final VoteMapper voteMapper;
     private final VoteEventProducer voteEventProducer;
     private final ApplicationEventPublisher eventPublisher;
+    private final VoteOutcomeRecorder outcomeRecorder;
     private final boolean chainEnabled;
 
     public VoteService(VoteRepository voteRepository, VoteHasher voteHasher, CandidateValidator candidateValidator,
                        VoteRedisStore redisStore, ChainHeadService chainHeadService, VoteMapper voteMapper,
                        VoteEventProducer voteEventProducer, ApplicationEventPublisher eventPublisher,
+                       VoteOutcomeRecorder outcomeRecorder,
                        VotingProperties properties) {
         this.voteRepository = voteRepository;
         this.voteHasher = voteHasher;
@@ -65,15 +69,34 @@ public class VoteService implements VoteServiceInterface {
         this.voteMapper = voteMapper;
         this.voteEventProducer = voteEventProducer;
         this.eventPublisher = eventPublisher;
+        this.outcomeRecorder = outcomeRecorder;
         this.chainEnabled = properties.chain().enabled();
     }
 
     @Override
     @Transactional
     public VoteResponse castVote(UUID userId, VoteRequest request) {
+        try {
+            return castOnce(userId, request);
+        } catch (DuplicateVoteException e) {
+            outcomeRecorder.rejected(userId, request.getElectionId(), VoteOutcomeRecorder.Outcome.DUPLICATE);
+            throw e;
+        } catch (InvalidCandidateException e) {
+            outcomeRecorder.rejected(userId, request.getElectionId(), VoteOutcomeRecorder.Outcome.INVALID_CANDIDATE);
+            throw e;
+        } catch (CandidateServiceUnavailableException e) {
+            outcomeRecorder.rejected(userId, request.getElectionId(),
+                    VoteOutcomeRecorder.Outcome.CANDIDATE_SERVICE_UNAVAILABLE);
+            throw e;
+        }
+    }
+
+    /** One vote attempt; a successful new vote is recorded after commit by {@link VoteCastSideEffects}. */
+    private VoteResponse castOnce(UUID userId, VoteRequest request) {
         Optional<Vote> previous = findIdempotentVote(userId, request.getIdempotencyKey());
         if (previous.isPresent()) {
             log.info("Idempotent replay for user {} key {}", userId, request.getIdempotencyKey());
+            outcomeRecorder.replayed(userId, previous.get().getExternalId());
             return voteMapper.toReplayResponse(previous.get());
         }
         if (redisStore.hasVoted(userId, request.getElectionId())) {
@@ -138,6 +161,7 @@ public class VoteService implements VoteServiceInterface {
         if (valid) {
             voteEventProducer.publishVoteVerified(response);
         }
+        outcomeRecorder.verified(voteExternalId, valid);
         return response;
     }
 
@@ -162,6 +186,7 @@ public class VoteService implements VoteServiceInterface {
             }
         }
         boolean valid = brokenLinks == 0;
+        outcomeRecorder.chainValidated(electionId, valid);
         return ChainValidationResponse.builder()
                 .electionId(electionId)
                 .chainValid(valid)

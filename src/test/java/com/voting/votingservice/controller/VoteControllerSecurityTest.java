@@ -152,6 +152,13 @@ class VoteControllerSecurityTest {
     }
 
     @Test
+    void unknownPath_is404_not500() throws Exception {
+        mockMvc.perform(get("/api/v1/votes/does/not/exist")
+                        .header("Authorization", TestTokens.bearer(voterId, "ROLE_VOTER")))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
     void voteCounts_arePublic() throws Exception {
         when(voteService.getVoteCounts(electionId))
                 .thenReturn(VoteCountResponse.builder().electionId(electionId).candidateVoteCounts(List.of()).build());

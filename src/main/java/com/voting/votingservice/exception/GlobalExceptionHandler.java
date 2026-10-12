@@ -3,10 +3,12 @@ package com.voting.votingservice.exception;
 import com.voting.votingservice.dto.ApiResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.AuthenticationException;
+import org.springframework.web.ErrorResponse;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -74,8 +76,18 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ApiResponse<Void>> handleUnexpected(Exception ex) {
+        if (ex instanceof ErrorResponse springWebError) {
+            // Spring's own client errors (unknown path 404, wrong method 405, …) keep their status
+            HttpStatusCode status = springWebError.getStatusCode();
+            return ResponseEntity.status(status).body(ApiResponse.error(reasonPhrase(status)));
+        }
         log.error("Unhandled exception", ex);
         return error(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred.");
+    }
+
+    private static String reasonPhrase(HttpStatusCode status) {
+        HttpStatus known = HttpStatus.resolve(status.value());
+        return known == null ? "Request failed" : known.getReasonPhrase();
     }
 
     private static ResponseEntity<ApiResponse<Void>> error(HttpStatus status, String message) {

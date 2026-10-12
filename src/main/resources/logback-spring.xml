@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Logging for all profiles.
+  - default:   Spring Boot's readable console pattern (includes traceId/spanId when tracing is active)
+  - json-logs: one JSON object per line on the console (for Docker / Kubernetes log collection)
+  - logstash:  additionally ships the JSON lines over TCP to ${LOGSTASH_HOST}:${LOGSTASH_PORT} (ELK)
+  The AUDIT logger carries security-relevant events (logins, candidate changes, votes) as key=value fields.
+-->
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+    <springProperty scope="context" name="SERVICE_NAME" source="spring.application.name"/>
+
+    <springProfile name="!json-logs">
+        <include resource="org/springframework/boot/logging/logback/console-appender.xml"/>
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+    </springProfile>
+
+    <springProfile name="json-logs">
+        <appender name="JSON_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                <includeContext>false</includeContext>
+                <customFields>{"service":"${SERVICE_NAME}"}</customFields>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="JSON_CONSOLE"/>
+        </root>
+    </springProfile>
+
+    <springProfile name="logstash">
+        <springProperty scope="context" name="LOGSTASH_DESTINATION" source="logging.logstash.destination"
+                        defaultValue="localhost:5000"/>
+        <appender name="LOGSTASH" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
+            <destination>${LOGSTASH_DESTINATION}</destination>
+            <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+                <includeContext>false</includeContext>
+                <customFields>{"service":"${SERVICE_NAME}"}</customFields>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="LOGSTASH"/>
+        </root>
+    </springProfile>
+</configuration>

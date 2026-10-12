@@ -18,8 +18,17 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
+  # prod = JSON logs; add "logstash" to also ship them to ELK
+  profiles:
+    group:
+      prod: json-logs
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    # Propagate trace ids through Kafka headers (vote.cast → result-service)
+    template:
+      observation-enabled: true
+    listener:
+      observation-enabled: true
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
@@ -92,6 +101,20 @@ management:
     health:
       probes:
         enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  tracing:
+    sampling:
+      # 0.0 locally: trace ids still appear in logs but nothing is exported; docker-compose sets 1.0
+      probability: ${TRACING_SAMPLING:0.0}
+  zipkin:
+    tracing:
+      endpoint: ${ZIPKIN_URL:http://localhost:9411/api/v2/spans}
   health:
     circuitbreakers:
       enabled: true
+
+logging:
+  logstash:
+    destination: ${LOGSTASH_HOST:localhost}:${LOGSTASH_PORT:5000}

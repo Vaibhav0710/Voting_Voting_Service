@@ -8,7 +8,7 @@ import org.springframework.transaction.event.TransactionalEventListener;
 
 /**
  * Runs the side effects of a cast vote only once its database transaction has committed,
- * so Redis and Kafka never announce a vote that was rolled back.
+ * so Redis, Kafka, metrics and the audit log never announce a vote that was rolled back.
  */
 @Component
 @RequiredArgsConstructor
@@ -16,6 +16,7 @@ public class VoteCastSideEffects {
 
     private final VoteRedisStore redisStore;
     private final VoteEventProducer voteEventProducer;
+    private final VoteOutcomeRecorder outcomeRecorder;
 
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onVoteRecorded(VoteRecordedEvent event) {
@@ -23,5 +24,6 @@ public class VoteCastSideEffects {
         redisStore.markVoted(vote.getUserId(), vote.getElectionId());
         redisStore.rememberIdempotentVote(vote.getUserId(), event.idempotencyKey(), vote.getVoteId());
         voteEventProducer.publishVoteCast(vote);
+        outcomeRecorder.cast(vote.getUserId(), vote.getVoteId());
     }
 }

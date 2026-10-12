@@ -50,6 +50,7 @@ class VoteServiceTest {
     @Mock private ChainHeadService chainHeadService;
     @Mock private VoteEventProducer voteEventProducer;
     @Mock private ApplicationEventPublisher eventPublisher;
+    @Mock private VoteOutcomeRecorder outcomeRecorder;
 
     private final VoteHasher voteHasher = new VoteHasher();
     private final UUID userId = UUID.randomUUID();
@@ -71,7 +72,7 @@ class VoteServiceTest {
                 new VotingProperties.Redis("vot:", 60, 60),
                 new VotingProperties.Chain(chainEnabled));
         return new VoteService(voteRepository, voteHasher, candidateValidator, redisStore, chainHeadService,
-                new VoteMapper(), voteEventProducer, eventPublisher, properties);
+                new VoteMapper(), voteEventProducer, eventPublisher, outcomeRecorder, properties);
     }
 
     private Vote storedVote(UUID owner, String prevHash) {
@@ -127,6 +128,7 @@ class VoteServiceTest {
             assertThat(response.isReplay()).isTrue();
             verify(voteRepository, never()).saveAndFlush(any());
             verifyNoInteractions(candidateValidator);
+            verify(outcomeRecorder).replayed(userId, original.getExternalId());
         }
 
         @Test
@@ -149,6 +151,7 @@ class VoteServiceTest {
             assertThatThrownBy(() -> service(false).castVote(userId, request))
                     .isInstanceOf(DuplicateVoteException.class);
             verifyNoInteractions(candidateValidator);
+            verify(outcomeRecorder).rejected(userId, electionId, VoteOutcomeRecorder.Outcome.DUPLICATE);
         }
 
         @Test
@@ -159,6 +162,7 @@ class VoteServiceTest {
             assertThatThrownBy(() -> service(false).castVote(userId, request))
                     .isInstanceOf(DuplicateVoteException.class);
             verifyNoInteractions(eventPublisher);
+            verify(outcomeRecorder).rejected(userId, electionId, VoteOutcomeRecorder.Outcome.DUPLICATE);
         }
 
         @Test
@@ -170,6 +174,7 @@ class VoteServiceTest {
                     .isInstanceOf(InvalidCandidateException.class)
                     .hasMessage("Candidate is DISQUALIFIED");
             verify(voteRepository, never()).saveAndFlush(any());
+            verify(outcomeRecorder).rejected(userId, electionId, VoteOutcomeRecorder.Outcome.INVALID_CANDIDATE);
         }
 
         @Test
@@ -213,6 +218,7 @@ class VoteServiceTest {
             assertThat(response.isHashValid()).isTrue();
             assertThat(vote.getStatus()).isEqualTo(VoteStatus.VERIFIED);
             verify(voteEventProducer).publishVoteVerified(response);
+            verify(outcomeRecorder).verified(vote.getExternalId(), true);
         }
 
         @Test
@@ -266,6 +272,7 @@ class VoteServiceTest {
 
             assertThat(response.isChainValid()).isFalse();
             assertThat(response.getBrokenLinks()).isEqualTo(2);
+            verify(outcomeRecorder).chainValidated(electionId, false);
         }
 
         @Test
