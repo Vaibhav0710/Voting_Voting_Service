@@ -200,10 +200,10 @@ Candidate Service outages.
    cd voting-service
    ```
 
-2. **Start Infrastructure (Kafka, Zookeeper, Redis)**
-   *(A `docker-compose.yml` is provided at the root of the project to spin up infrastructure)*
+2. **Start Infrastructure (Postgres, Redis, Kafka, Eureka)**
+   *(from the root `Voting_System` repo, after `cp .env.example .env`)*
    ```bash
-   docker-compose up -d
+   docker compose up -d postgres redis kafka eureka-server
    ```
 
 3. **Set environment variables**
@@ -223,6 +223,18 @@ Candidate Service outages.
 
 ---
 
+
+## 🐳 Docker
+
+```bash
+docker build -t voting/voting-service:1.0.0 .
+```
+
+The multi-stage `Dockerfile` builds the jar with Maven and runs it on a Java 17 JRE (Alpine) as a non-root user, with a
+health check on `/actuator/health/readiness` (port 8083). To run the whole system, use `docker compose up -d --build` in
+the root `Voting_System` repo (see its README).
+
+---
 
 ## 📈 Observability
 
