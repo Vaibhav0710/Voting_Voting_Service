@@ -105,7 +105,7 @@ http://localhost:8083/api/v1/votes
 
 ## 🗄️ Database Schema
 
-**Database:** `voting_service_db` (isolated — each microservice owns its data)
+**Database:** schema `voting_service` in the shared `voting_system` database (isolated — each microservice owns its schema)
 
 ```sql
 CREATE TABLE votes (
@@ -208,7 +208,7 @@ Candidate Service outages.
 
 3. **Set environment variables**
    ```bash
-   export VOTING_DB_URL=jdbc:postgresql://localhost:5432   # server base URL; /voting_service_db is appended
+   export VOTING_DB_URL=jdbc:postgresql://localhost:5432   # server base URL; /voting_system?currentSchema=voting_service is appended
    export VOTING_DB_USER=postgres
    export VOTING_DB_PASSWORD=yourpassword
    export JWT_SECRET=<same Base64 secret as user-service>

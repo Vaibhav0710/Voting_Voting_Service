@@ -5,8 +5,9 @@ spring:
   application:
     name: voting-service
   datasource:
-    # VOTING_DB_URL is the server base URL shared by all services, e.g. jdbc:postgresql://localhost:5432
-    url: ${VOTING_DB_URL}/voting_service_db
+    # VOTING_DB_URL is the server base URL shared by all services, e.g. jdbc:postgresql://localhost:5432.
+    # All services share the voting_system database; each owns one schema (currentSchema).
+    url: ${VOTING_DB_URL}/voting_system?currentSchema=voting_service
     username: ${VOTING_DB_USER}
     password: ${VOTING_DB_PASSWORD}
   jpa:
