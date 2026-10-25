@@ -23,6 +23,13 @@ spring:
   profiles:
     group:
       prod: json-logs
+  cloud:
+    openfeign:
+      client:
+        config:
+          default:
+            connectTimeout: 500
+            readTimeout: 1000
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     # Propagate trace ids through Kafka headers (vote.cast → result-service)
