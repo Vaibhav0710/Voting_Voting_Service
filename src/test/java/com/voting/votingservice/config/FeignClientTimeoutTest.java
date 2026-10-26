@@ -19,8 +19,17 @@ class FeignClientTimeoutTest {
     // under resilience4j.timelimiter.configs.default.timeout-duration: 5s
     private static final long GATEWAY_TIMEOUT_MS = 5000L;
 
+    // Minimum required headroom under the gateway timeout to ensure the vote's own DB
+    // write and per-election chain lock complete within the same gateway time budget
+    private static final long MIN_HEADROOM_MS = 500L;
+
     // Resilience4j candidateService retry max-attempts configured in application.yml
+    // under resilience4j.retry.instances.candidateService.max-attempts: 3
     private static final int MAX_RETRY_ATTEMPTS = 3;
+
+    // Resilience4j candidateService retry wait-duration configured in application.yml
+    // under resilience4j.retry.instances.candidateService.wait-duration: 200ms
+    private static final long RETRY_WAIT_DURATION_MS = 200L;
 
     @MockBean private VoteRedisStore redisStore;
     @MockBean private CandidateStatusCache statusCache;
@@ -40,9 +49,11 @@ class FeignClientTimeoutTest {
         int readTimeout = defaultConfig.getReadTimeout();
 
         assertThat(connectTimeout).isEqualTo(500);
-        assertThat(readTimeout).isEqualTo(1000);
+        assertThat(readTimeout).isEqualTo(700);
 
-        long worstCaseTotalMs = (long) MAX_RETRY_ATTEMPTS * (connectTimeout + readTimeout);
+        long worstCaseTotalMs = (long) MAX_RETRY_ATTEMPTS * (connectTimeout + readTimeout)
+                + (long) (MAX_RETRY_ATTEMPTS - 1) * RETRY_WAIT_DURATION_MS;
         assertThat(worstCaseTotalMs).isLessThan(GATEWAY_TIMEOUT_MS);
+        assertThat(GATEWAY_TIMEOUT_MS - worstCaseTotalMs).isGreaterThanOrEqualTo(MIN_HEADROOM_MS);
     }
 }

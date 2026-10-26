@@ -29,7 +29,7 @@ spring:
         config:
           default:
             connectTimeout: 500
-            readTimeout: 1000
+            readTimeout: 700
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     # Propagate trace ids through Kafka headers (vote.cast → result-service)
